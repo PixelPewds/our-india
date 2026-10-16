@@ -1,0 +1,230 @@
+package com.ourindia.app.data.geo
+
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.maplibre.android.geometry.LatLngBounds
+import org.maplibre.geojson.FeatureCollection
+import org.maplibre.geojson.MultiPolygon
+import org.maplibre.geojson.Point
+import org.maplibre.geojson.Polygon
+import java.util.zip.GZIPInputStream
+import timber.log.Timber
+
+/** Resolved geographic location from GPS coordinates */
+data class ResolvedLocation(
+    val country: String = "India",
+    val state: String?,
+    val district: String? = null,
+    val city: String? = null,
+    val taluka: String? = null,
+    // The point that was resolved, so the map can pin it instead of a state's centre.
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    /** GPS accuracy of the fix, when it came from the device rather than a map tap. */
+    val accuracyMeters: Float? = null
+) {
+    /** "Haveli, Pune, Maharashtra" — most specific first, for headers and complaint locality. */
+    val label: String get() = listOfNotNull(taluka, district, state).distinct().joinToString(", ")
+}
+
+/** Where the user is, shared by Home, Leaders and Report so one fix serves the whole app. */
+@javax.inject.Singleton
+class LocationStore @javax.inject.Inject constructor() {
+    val location = kotlinx.coroutines.flow.MutableStateFlow<ResolvedLocation?>(null)
+}
+
+/** Abstraction for resolving geographical coordinates to structured location info */
+interface GeographicResolver {
+    suspend fun resolveLocation(latitude: Double, longitude: Double): ResolvedLocation?
+    // Backward compat
+    suspend fun resolveRegion(latitude: Double, longitude: Double): String? {
+        return resolveLocation(latitude, longitude)?.state
+    }
+}
+
+/**
+ * Local region resolution using bundled optimized GeoJSON files (gzipped).
+ * Implements precise Point-in-Polygon (PiP) algorithms using MapLibre Turf.
+ */
+class LocalGeographicResolver(private val context: Context) : GeographicResolver {
+
+    // Lazy initialization saves memory by only loading boundary files into memory
+    // exactly when they are required for resolution. The map reuses the same parse.
+    val stateFeatures by lazy { loadFeatures(STATES_ASSET) }
+    val districtFeatures by lazy { loadFeatures(DISTRICTS_ASSET) }
+    private val subDistrictFeatures by lazy { loadFeatures(SUB_DISTRICTS_ASSET) }
+
+    /**
+     * Raw GeoJSON text of a bundled boundary file; call off the main thread.
+     *
+     * The packager inflates `.gz` assets and drops the extension, so the APK holds
+     * `geo/states.geojson`, not the `.gz` that sits in src/main/assets. Opening the
+     * `.gz` name threw FileNotFoundException on every device: the map drew nothing and
+     * every GPS fix resolved as "outside India". Try the packaged name first.
+     */
+    fun readGeoJson(assetPath: String): String? {
+        val plain = assetPath.removeSuffix(".gz")
+        runCatching { return context.assets.open(plain).bufferedReader().use { it.readText() } }
+        return try {
+            context.assets.open("$plain.gz").use { input ->
+                GZIPInputStream(input).bufferedReader().use { it.readText() }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Bundled GeoJSON missing as both $plain and $plain.gz")
+            null
+        }
+    }
+
+    private fun loadFeatures(assetPath: String): FeatureCollection? =
+        readGeoJson(assetPath)?.let { FeatureCollection.fromJson(it) }
+
+    /**
+     * Bounding box of a state, or of a district inside it. Null when the name is not in
+     * the boundary files (seed data says "Bengaluru", the file says "Bangalore").
+     * The district file stores state names upper-cased, hence the case-blind compares.
+     */
+    suspend fun boundsOf(state: String, district: String? = null): LatLngBounds? = withContext(Dispatchers.Default) {
+        val feature = if (district == null) {
+            stateFeatures?.features()?.firstOrNull { it.getStringProperty("state").equals(state, ignoreCase = true) }
+        } else {
+            districtFeatures?.features()?.firstOrNull {
+                it.getStringProperty("state").equals(state, ignoreCase = true) &&
+                    it.getStringProperty("district").equals(district, ignoreCase = true)
+            }
+        }
+        val rings = when (val g = feature?.geometry()) {
+            is Polygon -> g.coordinates()
+            is MultiPolygon -> g.coordinates().flatten()
+            else -> return@withContext null
+        }
+        var north = -90.0; var south = 90.0; var east = -180.0; var west = 180.0
+        rings.forEach { ring ->
+            ring.forEach { p ->
+                north = maxOf(north, p.latitude()); south = minOf(south, p.latitude())
+                east = maxOf(east, p.longitude()); west = minOf(west, p.longitude())
+            }
+        }
+        if (north < south) null else LatLngBounds.from(north, east, south, west)
+    }
+
+    override suspend fun resolveLocation(latitude: Double, longitude: Double): ResolvedLocation? = withContext(Dispatchers.Default) {
+        val point = Point.fromLngLat(longitude, latitude)
+        
+        var stateName: String? = null
+        var districtName: String? = null
+        var subDistrictName: String? = null
+
+        // 1. Resolve State (Top level)
+        stateFeatures?.features()?.firstOrNull { feature ->
+            val geom = feature.geometry()
+            if (geom is Polygon) isPointInPolygon(point, geom)
+            else if (geom is MultiPolygon) isPointInMultiPolygon(point, geom)
+            else false
+        }?.let { feature ->
+            stateName = feature.getStringProperty("state")
+        }
+
+        if (stateName == null) {
+            // Not falling within any Indian state boundaries
+            return@withContext null
+        }
+
+        // 2. Resolve District
+        districtFeatures?.features()?.firstOrNull { feature ->
+            // Optimization: Only check PiP for districts inside the resolved state
+            if (feature.getStringProperty("state")?.equals(stateName, ignoreCase = true) == true) {
+                val geom = feature.geometry()
+                if (geom is Polygon) isPointInPolygon(point, geom)
+                else if (geom is MultiPolygon) isPointInMultiPolygon(point, geom)
+                else false
+            } else false
+        }?.let { feature ->
+            districtName = feature.getStringProperty("district")
+        }
+
+        // 3. Resolve Sub-district
+        if (districtName != null) {
+            subDistrictFeatures?.features()?.firstOrNull { feature ->
+                // Optimization: Only check PiP for sub-districts inside the resolved district
+                val matchesState = feature.getStringProperty("state")?.equals(stateName, ignoreCase = true) == true
+                val matchesDistrict = feature.getStringProperty("district")?.equals(districtName, ignoreCase = true) == true
+                
+                if (matchesState && matchesDistrict) {
+                    val geom = feature.geometry()
+                    if (geom is Polygon) isPointInPolygon(point, geom)
+                    else if (geom is MultiPolygon) isPointInMultiPolygon(point, geom)
+                    else false
+                } else false
+            }?.let { feature ->
+                subDistrictName = feature.getStringProperty("subdistrict")
+            }
+        }
+
+        ResolvedLocation(
+            country = "India",
+            state = stateName,
+            district = districtName,
+            taluka = subDistrictName,
+            latitude = latitude,
+            longitude = longitude
+        )
+    }
+
+    companion object {
+        const val STATES_ASSET = "geo/states.geojson"
+        const val DISTRICTS_ASSET = "geo/districts.geojson"
+        const val SUB_DISTRICTS_ASSET = "geo/sub_districts.geojson"
+    }
+
+    // ── Point-In-Polygon (Ray-Casting Algorithm) ──────────────────────────
+
+    private fun isPointInMultiPolygon(point: Point, multiPolygon: MultiPolygon): Boolean {
+        for (polygonCoords in multiPolygon.coordinates()) {
+            if (isPointInPolygonCoords(point, polygonCoords)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isPointInPolygon(point: Point, polygon: Polygon): Boolean {
+        return isPointInPolygonCoords(point, polygon.coordinates())
+    }
+
+    private fun isPointInPolygonCoords(point: Point, coords: List<List<Point>>): Boolean {
+        if (coords.isEmpty()) return false
+        
+        // The first list is the outer boundary, subsequent lists are holes.
+        val outerRing = coords[0]
+        var isInside = rayCast(point, outerRing)
+        
+        // If inside outer ring, check if it's inside any hole (if it is, it's outside the polygon)
+        if (isInside) {
+            for (i in 1 until coords.size) {
+                if (rayCast(point, coords[i])) {
+                    return false
+                }
+            }
+        }
+        return isInside
+    }
+
+    private fun rayCast(point: Point, ring: List<Point>): Boolean {
+        var isInside = false
+        var j = ring.size - 1
+        for (i in ring.indices) {
+            val pi = ring[i]
+            val pj = ring[j]
+            
+            val intersects = ((pi.latitude() > point.latitude()) != (pj.latitude() > point.latitude())) &&
+                (point.longitude() < (pj.longitude() - pi.longitude()) * (point.latitude() - pi.latitude()) / (pj.latitude() - pi.latitude()) + pi.longitude())
+            
+            if (intersects) {
+                isInside = !isInside
+            }
+            j = i
+        }
+        return isInside
+    }
+}
